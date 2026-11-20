@@ -5,6 +5,7 @@ KMeans 聚类的真实业务分析小型项目。完整模拟客户、痛点、�
 ## 模块与业务流程
 数据接入（JSON/CSV、字段验证、批次指纹）→ 参数化分析（异步 Python worker）→ 结果复核（指标、图形、明细、解释、批准）→ 定时分发（本地收件箱、CSV/JSON、SHA256）；另有业务总览和审计轨迹。
 三个贯穿全栈的实体：Dataset 数据批次、Job 分析任务、Report 分发计划；辅助 User、Audit、Delivery。
+盲测试验（BlindTrial）独立成表：负责人单独录入盲测工况，揭盲前分析人员与观察员只能看到脱敏元数据（行数、指纹、状态、定稿口径K），批次明细不可读；盲测沿用定稿（已完成且已批准）分群的标准化尺度与簇中心按最近中心归群，不重新拟合，也不会进入任何 Dataset/Job。揭盲状态机 sealed → unblinding → revealed，中断后自动恢复为 sealed 并释放定稿锁，重试揭盲幂等不重复发布；揭盲期间定稿 Job 加 `blind_lock_id` 行锁，与页面改参试算（`/blind-trials/preview`，不落库）和新建分析任务互斥，只接受一方。
 
 ## 快速启动
 ```bash
@@ -25,6 +26,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 ## 技术与本地开发
 Python 3.12 / FastAPI / SQLAlchemy / NumPy / SciPy / scikit-learn；MySQL 8.0；Redis 7；Nginx；原生 HTML CSS JavaScript ES modules（用户指定）。后端所有校验、持久化和算法在服务端。无前端打包步骤。
 后端：安装 backend/requirements.txt，设置 DATABASE_URL、REDIS_URL、JWT_SECRET、ARTIFACT_DIR 后在 backend/ 执行 `python -m migrations.initial`、`python -m scripts.seed_demo`、`uvicorn src.main:app`，另开 `python -m src.worker`。前端使用带 /api 反向代理的 Nginx，直接打开 index.html 不支持 API。
+盲测接口：`GET/POST /blind-trials`（录入仅 admin）、`GET /blind-trials/{id}`（按角色脱敏）、`POST /blind-trials/{id}/unblind`（仅 admin，幂等）、`POST /blind-trials/preview`（admin/analyst 改参试算，不落库）。
 
 ## 目录与工程约定
 backend/src/{models,schemas,services,routes,controllers,middlewares,constants,config,utils}；backend/scripts/seed_demo.py；backend/migrations/initial.py。

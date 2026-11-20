@@ -1,11 +1,17 @@
 import time
 from fastapi import HTTPException
 from redis import Redis
+from sqlalchemy import select
 from src.config.settings import REDIS_URL
 from src.models import Dataset, Job
 from src.services.business import metadata
 def create(db, data, user):
-    if not db.get(Dataset,data.dataset_id): raise HTTPException(404,'数据批次不存在')
+    # 与揭盲共用数据批次行锁锚点：并发请求串行，只接受一方。
+    dataset=db.execute(select(Dataset).where(Dataset.id==data.dataset_id).with_for_update()).scalar_one_or_none()
+    if not dataset: raise HTTPException(404,'数据批次不存在')
+    # 盲测揭盲锁与改参试算互斥：定稿分群被揭盲占用时，拒绝在同批数据上新建试算。
+    locked=db.scalar(select(Job).where(Job.dataset_id==dataset.id,Job.blind_lock_id.isnot(None)))
+    if locked: raise HTTPException(409,'该数据批次的定稿分群正在揭盲锁定中，改参试算与揭盲只接受一方')
     allowed={p['key']:p for p in metadata().get('parameters',[])}
     if set(data.params)-set(allowed): raise HTTPException(422,'包含未知分析参数')
     params={k:p['default'] for k,p in allowed.items()}

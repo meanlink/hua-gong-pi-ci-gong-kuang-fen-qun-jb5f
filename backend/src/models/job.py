@@ -1,4 +1,4 @@
-from sqlalchemy import String, JSON, Double, ForeignKey, Boolean
+from sqlalchemy import String, JSON, Double, ForeignKey, Boolean, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 from src.config.database import Base
 class Job(Base):
@@ -14,3 +14,6 @@ class Job(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
     created_at: Mapped[float] = mapped_column(Double)
     finished_at: Mapped[float | None] = mapped_column(Double, nullable=True)
+    # 盲测揭盲锁：非空表示某个盲测试验正在揭盲并锁定该定稿分群，
+    # 与页面改参试算互斥，同一时刻只接受一方。
+    blind_lock_id: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

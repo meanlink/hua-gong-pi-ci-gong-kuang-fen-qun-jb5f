@@ -40,7 +40,111 @@ def seed_records():
     return rows
 
 
-def analyze(records, params):
+def parse_matrix(records):
+    """把记录解析为有限数值矩阵，并执行业务口径校验。"""
+    try:
+        x = np.asarray([[float(row[f]) for f in FEATURES] for row in records])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("温度、釜压、停留时间、收率须完整且为数值。") from exc
+    if not np.isfinite(x).all():
+        raise ValueError("工况须为有限值，釜压与停留时间须正数，收率须0~100。")
+    if (x[:, 1:3] <= 0).any() or (x[:, 3] < 0).any() or (x[:, 3] > 100).any():
+        raise ValueError("工况须为有限值，釜压与停留时间须正数，收率须0~100。")
+    return x
+
+
+def validate_fit_matrix(x, k):
+    if len(x) < max(30, k * 5):
+        raise ValueError("至少需要30条记录，且每个候选族群平均至少5条。")
+    if np.unique(x, axis=0).shape[0] < k or np.std(x, axis=0).min() < 1e-9:
+        raise ValueError("需要至少K种不同工况，且四个特征均须有变化。")
+
+
+def fit_model(x, k):
+    """定稿试验的标准拟合：Z分数标准化 + KMeans，返回拟合器与原始标签。"""
+    scaler = StandardScaler()
+    z = scaler.fit_transform(x)
+    model = KMeans(n_clusters=k, n_init=20, random_state=42)
+    assignment = model.fit_predict(z)
+    centers = scaler.inverse_transform(model.cluster_centers_)
+    score = float(silhouette_score(z, assignment))
+    # 以温度排序稳定显示标签，避免把算法内部随机标签误当业务等级。
+    order = np.argsort(centers[:, 0])
+    return scaler, model, assignment, centers, order, score
+
+
+def calibration_from_job(records, params):
+    """从定稿分群重放同口径拟合，导出可复现的归群口径快照。
+
+    盲测试验不重新拟合，只沿用这里保存的标准化尺度（mean/scale）与
+    标准化簇中心，按最近中心归群。
+    """
+    k = _parse_k(params)
+    x = parse_matrix(records)
+    validate_fit_matrix(x, k)
+    scaler, model, assignment, centers, order, score = fit_model(x, k)
+    # 显示标签按中心温度排序；保存 显示标签 -> 算法簇编号 的映射。
+    label_to_cluster = {display: int(cluster) for display, cluster in enumerate(order, 1)}
+    return {
+        "features": FEATURES,
+        "k": k,
+        "mean": [round(float(v), 8) for v in scaler.mean_],
+        "scale": [round(float(v), 8) for v in scaler.scale_],
+        # 标准化空间中的簇中心，按显示标签（温度升序）排列。
+        "centers_z": [[round(float(v), 8) for v in model.cluster_centers_[label_to_cluster[d]]] for d in range(1, k + 1)],
+        # 业务单位中心，同序排列，供页面展示口径对照。
+        "centers_native": [[round(float(v), 4) for v in centers[label_to_cluster[d]]] for d in range(1, k + 1)],
+        "label_to_cluster": label_to_cluster,
+        "baseline_silhouette": round(score, 4),
+        "method": metadata()["method"],
+    }
+
+
+def assign_with_calibration(records, calibration):
+    """盲测归群：用定稿尺度标准化盲测记录，再按最近定稿中心指派显示标签。
+
+    不触碰 KMeans 拟合，盲测数据不会影响定稿尺度与中心。
+    返回 (display_labels, native_centers_rows, detail_rows)。
+    """
+    feats = calibration["features"]
+    mean = np.asarray(calibration["mean"], dtype=float)
+    scale = np.asarray(calibration["scale"], dtype=float)
+    centers_z = np.asarray(calibration["centers_z"], dtype=float)
+    k = int(calibration["k"])
+    try:
+        x = np.asarray([[float(row[f]) for f in feats] for row in records])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("温度、釜压、停留时间、收率须完整且为数值。") from exc
+    if not np.isfinite(x).all() or (x[:, 1:3] <= 0).any() or (x[:, 3] < 0).any() or (x[:, 3] > 100).any():
+        raise ValueError("工况须为有限值，釜压与停留时间须正数，收率须0~100。")
+    if np.std(x, axis=0).min() < 1e-9:
+        raise ValueError("盲测批次的四个特征均须有变化。")
+    z = (x - mean) / scale
+    # 欧氏距离最近中心；显示标签即定稿的温度排序标签（1..K）。
+    distances = np.linalg.norm(z[:, None, :] - centers_z[None, :, :], axis=2)
+    nearest = np.argmin(distances, axis=1) + 1
+    rows = []
+    for i, row in enumerate(records):
+        rows.append({
+            "batch_id": str(row.get("batch_id", f"BLIND-{i+1}")),
+            "cluster": f"工况族群{int(nearest[i])}",
+            "distance": round(float(distances[i, nearest[i] - 1]), 4),
+            **{f: round(float(v), 2) for f, v in zip(feats, x[i])},
+        })
+    summary_rows = []
+    for display in range(1, k + 1):
+        mask = nearest == display
+        n = int(mask.sum())
+        center_native = calibration["centers_native"][display - 1]
+        summary_rows.append({
+            "cluster": f"工况族群{display}", "count": n,
+            "share_pct": round(n / len(records) * 100, 1),
+            **{f: round(float(v), 2) for f, v in zip(feats, center_native)},
+        })
+    return [int(v) for v in nearest], summary_rows, rows
+
+
+def _parse_k(params):
     try:
         raw_k = float(params.get("clusters", 3))
         k = int(raw_k)
@@ -48,24 +152,14 @@ def analyze(records, params):
         raise ValueError("K须为2~6的整数。") from exc
     if raw_k != k or not 2 <= k <= 6:
         raise ValueError("K须为2~6的整数。")
-    if len(records) < max(30, k * 5):
-        raise ValueError("至少需要30条记录，且每个候选族群平均至少5条。")
-    try:
-        x = np.asarray([[float(row[f]) for f in FEATURES] for row in records])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("温度、釜压、停留时间、收率须完整且为数值。") from exc
-    if not np.isfinite(x).all() or (x[:, 1:3] <= 0).any() or (x[:, 3] < 0).any() or (x[:, 3] > 100).any():
-        raise ValueError("工况须为有限值，釜压与停留时间须正数，收率须0~100。")
-    if np.unique(x, axis=0).shape[0] < k or np.std(x, axis=0).min() < 1e-9:
-        raise ValueError("需要至少K种不同工况，且四个特征均须有变化。")
-    scaler = StandardScaler()
-    z = scaler.fit_transform(x)
-    model = KMeans(n_clusters=k, n_init=20, random_state=42)
-    assignment = model.fit_predict(z)
-    centers = scaler.inverse_transform(model.cluster_centers_)
-    # 以温度排序稳定显示标签，避免把算法内部随机标签误当业务等级。
-    order = np.argsort(centers[:, 0])
-    score = float(silhouette_score(z, assignment))
+    return k
+
+
+def analyze(records, params):
+    k = _parse_k(params)
+    x = parse_matrix(records)
+    validate_fit_matrix(x, k)
+    scaler, model, assignment, centers, order, score = fit_model(x, k)
     rows = []
     chart_labels = []
     chart_values = [[] for _ in FEATURES]

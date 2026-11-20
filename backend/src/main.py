@@ -7,12 +7,21 @@ from redis import Redis
 from src.config.database import Session
 from src.config.settings import REDIS_URL
 from src.middlewares.requests import RequestControl
-from src.routes import auth, datasets, jobs, reports
+from src.routes import auth, datasets, jobs, reports, blind
 from src.controllers import catalog
 from migrations.initial import migrate
+from src.config.database import Session
+from src.services.blind import recover_interrupted
 @asynccontextmanager
 async def lifespan(app):
     migrate()
+    # 揭盲中断后恢复原定稿：残留的 unblinding 一律回到 sealed 并释放锁。
+    with Session() as db:
+        interrupted = recover_interrupted(db)
+        for t in interrupted:
+            from src.services.audit import record
+            record(db, 'system', 'blind.recover', {'id': t.id})
+        db.commit()
     if os.getenv('SEED_DEMO','true').lower()=='true':
         try:
             from scripts.seed_demo import seed
@@ -30,4 +39,4 @@ def health():
     with Session() as db:db.execute(text('SELECT 1'))
     r=Redis.from_url(REDIS_URL,socket_timeout=2);r.ping();r.close()
     return {'status':'healthy'}
-for router in [auth.router,datasets.router,jobs.router,reports.router,catalog.router]:app.include_router(router)
+for router in [auth.router,datasets.router,jobs.router,reports.router,blind.router,catalog.router]:app.include_router(router)
